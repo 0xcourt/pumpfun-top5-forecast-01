@@ -1,27 +1,50 @@
-// pumpfun-top5-forecast-01 entry (Node 22, standard library only).
+// pumpfun-top5-forecast-01 entry v2 (Node 22, standard library only).
 //
 // Method: horizon-aware Monte Carlo over the coins' log market caps.
 //  - Read every mark of /input/history.ndjson; for each mint fit the recent
-//    log10(cap in SOL) trend (linear regression over its observed marks,
+//    log10(cap in SOL) trend (linear regression over its last 12 marks,
 //    shrunk by observation count, blended with the last step), and project
 //    it forward to the answer reads. The projection horizon H is read from
 //    task.json (mean read time minus last mark time): ~0.7h in the rehearsal,
 //    ~10h in the final. Growth is mean-reverting: the drift is applied over
 //    H_eff = tau*(1-exp(-H/tau)) with tau=2.5h, so a coin cannot compound
 //    its last-hour growth for ten hours, and a small common decay applies.
+//    The 12-mark window keeps the fit on the recent lifecycle: in the final
+//    the history spans ~11h, and a slope fitted over all of it would drag
+//    stale growth into the forecast.
 //  - Pool (graduated) coins are projected as-is; curve / migrating coins
 //    take a mean penalty and extra variance (they must graduate to rank).
+//    Pool coins are bimodal over 10 min (12% crash >0.3 log, 12% jump
+//    >0.3 log, median +0.07) while curve coins barely move (median 0.00),
+//    so the per-coin sd is the main survival channel and it grows with H.
 //  - Future log caps are simulated (4000 draws, fixed seed, deterministic)
-//    with per-coin sd growing with H, so at long horizons the forecast
-//    spreads honestly instead of betting everything on the last snapshot.
-//    Place frequencies over the draws give the probabilities.
-//  - A large unnamed share is left per place (0.40 + 0.025*H, capped 0.60):
+//    over the top 150 candidates by projected mean, with per-coin sd growing
+//    with H, so at long horizons the forecast spreads honestly instead of
+//    betting everything on the last snapshot. The wide pool matters when
+//    churn is high: in holdouts the future winners are often ranked 61-150
+//    by projected mean (young curve coins with fat right tails), and
+//    widening 60 -> 150 improves the holdout mean by ~+3. Place
+//    frequencies over the draws give the probabilities.
+//  - A large unnamed share is left per place (0.45 + 0.025*H, capped 0.65):
 //    in the rehearsal 3 of the 5 coins at the last answer read were launched
 //    after the history ended, so a newcomer taking a place scores only from
-//    the unnamed share -- naming too much destroys that score.
-//  - Sizes: per place, the simulated place-cap distribution, blended toward
-//    a long-run anchor (log10 ~3.55 for place 1) with weight exp(-H/4) and
-//    widened with H, turned into bin probabilities with a normal CDF.
+//    the unnamed share -- naming too much destroys that score. The share is
+//    raised vs v1 (0.40/0.60) because the holdout sweep favours ~0.5 at
+//    short H and the final's newcomer fraction is higher still.
+//  - Sizes: the top-5 caps cluster tightly (at the last rehearsal mark
+//    1912-3638 SOL, a 0.28 log spread) and the cluster level RISES as fresh
+//    graduates arrive, so the per-place size centre follows the CLUSTER,
+//    not the incumbent ladder: centre_p = L + D(H) + offset_p, where L is
+//    the mean log10 cap of the last mark's top 5, D(H) is a saturating
+//    drift Dmax*(1-exp(-H/0.5)) with Dmax driven by the cluster's recent
+//    trend (clamped 0-0.5), and offsets are [+0.15, 0, -0.05, -0.08, -0.12].
+//    v1 centred sizes on the projected means of the current #3-#5
+//    incumbents, which are small curve coins; when new graduates exploded
+//    the ladder its size centres sat 0.5-1.3 log too low and the realised
+//    bins scored ~0 (floor). On 6 holdouts the cluster centre improves
+//    size from -21.2 to -16.6. The sd is the simulated place-cap dispersion
+//    floored at 0.40 and growing with H (0.75-0.9 at H=10), so a centre
+//    error at long horizon costs little.
 //
 // Deterministic: fixed seed, no Date.now / Math.random / network.
 // Reads $MAKEFUN_INPUT_DIR / $MAKEFUN_OUTPUT_DIR, else /input / /output.
@@ -34,6 +57,12 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const MICRO = 1_000_000;
 const SIMS = 4000;
 const TAU_H = 2.5;
+const RECENT_MARKS = 12;
+const UNNAMED_BASE = 0.45;
+const UNNAMED_PERH = 0.025;
+const UNNAMED_CAP = 0.65;
+const SLOPE_CLAMP = 0.6;
+const CAND_TOP = 150;
 
 interface Row {
   rank: number;
@@ -74,7 +103,28 @@ if (task.reads && task.reads.length > 0) {
   H = Math.max(0, Math.min(24, (meanRead - tLast) / 3600000));
 }
 const hEff = TAU_H * (1 - Math.exp(-H / TAU_H));
-const unnamedShare = Math.min(0.6, Math.max(0.4, 0.4 + 0.025 * H));
+const unnamedShare = Math.min(UNNAMED_CAP, Math.max(UNNAMED_BASE, UNNAMED_BASE + UNNAMED_PERH * H));
+
+// Cluster level L: mean log10 cap of the last mark's top 5, and its recent
+// trend per 10 min (mean of the last <=3 increments, clamped).
+const logCapOf = (r: Row): number => Math.log10(Number(BigInt(r.market_cap_lamports))) - 9;
+const clusterLevel = (rows: Row[]): number => {
+  const top = [...rows].sort((a, b) => a.rank - b.rank).slice(0, task.places);
+  return top.reduce((s, r) => s + logCapOf(r), 0) / top.length;
+};
+const clusterLevels = marks
+  .filter((m) => m.rows!.length >= task.places)
+  .map((m) => clusterLevel(m.rows!));
+const L = clusterLevels[clusterLevels.length - 1]!;
+const incs: number[] = [];
+for (let i = Math.max(1, clusterLevels.length - 3); i < clusterLevels.length; i++) {
+  incs.push(clusterLevels[i]! - clusterLevels[i - 1]!);
+}
+const trend10 = incs.length > 0 && incs.every((v) => Number.isFinite(v))
+  ? incs.reduce((s, v) => s + v, 0) / incs.length : 0;
+const trend10c = Math.max(-0.1, Math.min(0.25, trend10));
+const dMax = Math.max(0, Math.min(0.5, 0.2 + 2 * trend10c));
+const sizeDrift = dMax * (1 - Math.exp(-H / 0.5));
 
 // Per-mint series.
 interface Pt { t: number; logCap: number; venue: string; complete: boolean; created: number }
@@ -82,7 +132,7 @@ const series = new Map<string, Pt[]>();
 for (const m of marks) {
   const t = Date.parse(m.at);
   for (const r of m.rows!) {
-    const logCap = Math.log10(Number(BigInt(r.market_cap_lamports))) - 9;
+    const logCap = logCapOf(r);
     const arr = series.get(r.mint) ?? [];
     arr.push({ t, logCap, venue: r.venue ?? 'curve', complete: !!r.complete, created: r.created_at ? Date.parse(r.created_at) : t });
     series.set(r.mint, arr);
@@ -91,11 +141,13 @@ for (const m of marks) {
 
 interface Cand { mint: string; mean: number; sd: number; lastLog: number }
 const cands: Cand[] = [];
-for (const [mint, pts] of series) {
+for (const [mint, ptsAll] of series) {
+  // Recent window only: the last RECENT_MARKS observations.
+  const pts = ptsAll.slice(-RECENT_MARKS);
   const n = pts.length;
   const last = pts[n - 1]!;
   const lastLog = last.logCap;
-  // Linear regression of logCap on time (hours since first obs).
+  // Linear regression of logCap on time (hours since first obs in window).
   let slope = 0;
   if (n >= 2) {
     const t0 = pts[0]!.t;
@@ -118,7 +170,7 @@ for (const [mint, pts] of series) {
   // (Calmer than the raw fits: 2-3 points over 20-30 min overstate a
   // coin's hourly growth, and the rehearsal backtest favours the calmer fit.)
   slope = slope * (n / (n + 3));
-  slope = Math.max(-0.6, Math.min(0.6, slope));
+  slope = Math.max(-SLOPE_CLAMP, Math.min(SLOPE_CLAMP, slope));
   let mean = lastLog + slope * hEff - 0.02 * H;
   let sd = 0.28 + 0.055 * H;
   if (n < 3) sd += 0.12;
@@ -131,7 +183,7 @@ for (const [mint, pts] of series) {
   cands.push({ mint, mean, sd, lastLog });
 }
 cands.sort((a, b) => b.mean - a.mean || (a.mint < b.mint ? -1 : 1));
-const pool = cands.slice(0, 60);
+const pool = cands.slice(0, CAND_TOP);
 
 // Deterministic PRNG (mulberry32) + Box-Muller.
 let seed = 20261112;
@@ -187,11 +239,8 @@ const byRank = [...pool].sort((a, b) => {
 });
 const top5 = byRank.slice(0, task.places).map((c) => c.mint);
 
-// Sizes: normal CDF around a per-place mean taken from the *deterministic*
-// ranked projection (the k-th largest projected mean), plus a small
-// max/newcomer uplift -- NOT the simulated max, whose mean is biased up by
-// ~2 sd over 60 independent draws. Blend toward a long-run anchor with
-// weight exp(-H/4) and widen with H.
+// Sizes: normal CDF around the cluster centre (see header), sd from the
+// simulated place-cap dispersion, floored and widened with H.
 function erfc(x: number): number {
   const z = Math.abs(x);
   const t = 1 / (1 + 0.5 * z);
@@ -199,20 +248,16 @@ function erfc(x: number): number {
   return x >= 0 ? r : 2 - r;
 }
 const above = (x: number, mean: number, sd: number): number => (x === -Infinity ? 1 : x === Infinity ? 0 : 0.5 * erfc((x - mean) / (sd * Math.SQRT2)));
-const wAnchor = Math.exp(-H / 4);
 const sizes: Array<{ place: number; bin: number; p: number }> = [];
 const edges = task.size.edges;
-const rankedMeans = [...pool].sort((a, b) => b.mean - a.mean || (a.mint < b.mint ? -1 : 1)).map((c) => c.mean);
-const maxUplift = [0.18, 0.1, 0.06, 0.03, 0];
+const sizeOffsets = [0.15, 0, -0.05, -0.08, -0.12];
 for (let p = 0; p < task.places; p++) {
   const logs = placeLogs[p]!;
   const simMean = logs.reduce((s, v) => s + v, 0) / logs.length;
   const simVar = logs.reduce((s, v) => s + (v - simMean) * (v - simMean), 0) / logs.length;
   const simSd = Math.sqrt(simVar);
-  const anchor = 3.55 - 0.06 * p;
-  const rawMean = (rankedMeans[p] ?? simMean) + (maxUplift[p] ?? 0);
-  const mean = wAnchor * rawMean + (1 - wAnchor) * anchor;
-  const sd = Math.min(0.9, Math.max(simSd * 0.6, 0.35 + 0.04 * H));
+  const mean = L + sizeDrift + (sizeOffsets[p] ?? 0);
+  const sd = Math.min(0.9, Math.max(simSd * 0.6, 0.4 + 0.04 * H));
   for (let bin = 0; bin <= edges.length; bin++) {
     const lo = bin === 0 ? -Infinity : edges[bin - 1]!;
     const hi = bin === edges.length ? Infinity : edges[bin]!;
